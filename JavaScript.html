@@ -1,0 +1,721 @@
+<script>
+let currentUser = null;
+let entryModal, adminEditModal, denyModal;
+let pendingActions = { approve: [], deny: [] };
+
+document.addEventListener('DOMContentLoaded', function() {
+  // Initialize modals
+  entryModal = new bootstrap.Modal(document.getElementById('entryModal'));
+  adminEditModal = new bootstrap.Modal(document.getElementById('adminEditModal'));
+  denyModal = new bootstrap.Modal(document.getElementById('denyModal'));
+
+  // Login form
+  document.getElementById('loginForm').addEventListener('submit', handleLogin);
+  document.getElementById('resetPasswordBtn').addEventListener('click', requestPassword);
+  
+  // Logout buttons
+  document.getElementById('logoutBtn').addEventListener('click', logout);
+  document.getElementById('adminLogoutBtn').addEventListener('click', logout);
+  
+  // Employee actions
+  document.getElementById('addEntryBtn').addEventListener('click', showAddEntry);
+  document.getElementById('saveEntryBtn').addEventListener('click', saveEntry);
+  document.getElementById('submitWeekBtn').addEventListener('click', submitWeek);
+  
+  // Admin actions
+  document.getElementById('saveAdminEditBtn').addEventListener('click', saveAdminEdit);
+  document.getElementById('confirmDenyBtn').addEventListener('click', confirmDeny);
+  document.getElementById('installTriggerBtn').addEventListener('click', installTrigger);
+  
+  // Auto-calculate gross pay
+  document.getElementById('entryHours').addEventListener('input', calculateGrossPay);
+  
+  // Tab change events
+  document.querySelector('a[href="#reviewTab"]').addEventListener('shown.bs.tab', loadSubmittedTimesheets);
+  document.querySelector('a[href="#historicalTab"]').addEventListener('shown.bs.tab', loadAllHistorical);
+});
+
+// ===== LOGIN FUNCTIONS =====
+function handleLogin(e) {
+  e.preventDefault();
+  const username = document.getElementById('username').value;
+  const password = document.getElementById('password').value;
+  
+  showLoading('loginForm');
+  
+  google.script.run
+    .withSuccessHandler(onLoginSuccess)
+    .withFailureHandler(onLoginFailure)
+    .validateLogin(username, password);
+}
+
+function onLoginSuccess(result) {
+  hideLoading('loginForm');
+  
+  if (result.success) {
+    currentUser = result.user;
+    document.getElementById('loginScreen').classList.add('d-none');
+    
+    if (currentUser.role === 'Admin') {
+      showAdminDashboard();
+    } else {
+      showEmployeeDashboard();
+    }
+  } else {
+    showError('loginError', result.message);
+  }
+}
+
+function onLoginFailure(error) {
+  hideLoading('loginForm');
+  showError('loginError', 'Login failed: ' + error.message);
+}
+
+function requestPassword() {
+  const username = document.getElementById('username').value;
+  if (!username) {
+    showError('loginError', 'Please enter your username first');
+    return;
+  }
+  
+  google.script.run
+    .withSuccessHandler(function(result) {
+      if (result.success) {
+        showSuccess('loginSuccess', result.message);
+      } else {
+        showError('loginError', result.message);
+      }
+    })
+    .withFailureHandler(function(error) {
+      showError('loginError', 'Request failed: ' + error.message);
+    })
+    .requestNewPassword(username);
+}
+
+function logout() {
+  currentUser = null;
+  document.getElementById('employeeDashboard').classList.add('d-none');
+  document.getElementById('adminDashboard').classList.add('d-none');
+  document.getElementById('loginScreen').classList.remove('d-none');
+  document.getElementById('loginForm').reset();
+}
+
+// ===== EMPLOYEE DASHBOARD =====
+function showEmployeeDashboard() {
+  document.getElementById('employeeName').textContent = currentUser.name;
+  document.getElementById('employeeDashboard').classList.remove('d-none');
+  loadPendingTimesheet();
+  loadHistoricalTimesheets();
+}
+
+function loadPendingTimesheet() {
+  google.script.run
+    .withSuccessHandler(displayPendingEntries)
+    .withFailureHandler(handleError)
+    .getPendingTimesheet(currentUser.employeeId);
+}
+
+function displayPendingEntries(entries) {
+  const container = document.getElementById('currentWeekEntries');
+  
+  if (entries.length === 0) {
+    container.innerHTML = `
+      <div class="text-center text-muted py-4">
+        <i class="fas fa-inbox fa-3x mb-3"></i>
+        <p>No entries for this week yet. Click "Add Entry" to start.</p>
+      </div>
+    `;
+    document.getElementById('submitWeekBtn').disabled = true;
+    updateTotals(entries);
+    return;
+  }
+  
+  // Check if any entry is submitted (all must be same status)
+  const hasSubmitted = entries.some(e => e.status === 'Submitted');
+  const canEdit = !hasSubmitted;
+  
+  container.innerHTML = entries.map(entry => `
+    <div class="entry-card">
+      <div class="row align-items-center">
+        <div class="col-md-2">
+          <strong>${entry.date}</strong>
+        </div>
+        <div class="col-md-2">
+          <span class="badge bg-info">${entry.hours} hrs</span>
+        </div>
+        <div class="col-md-2">
+          <span class="badge bg-success">${formatCurrency(entry.grossPay)}</span>
+        </div>
+        <div class="col-md-4">
+          <small class="text-muted">${entry.description}</small>
+        </div>
+        <div class="col-md-2 text-end">
+          ${entry.status === 'Pending' ? `
+            <button class="btn btn-sm btn-outline-primary me-1" onclick="editEntry('${entry.entryId}', '${entry.date}', ${entry.hours}, '${entry.description.replace(/'/g, "\\'")}')">
+              <i class="fas fa-edit"></i>
+            </button>
+            <button class="btn btn-sm btn-outline-danger" onclick="deleteEntry('${entry.entryId}')">
+              <i class="fas fa-trash"></i>
+            </button>
+          ` : `
+            <span class="badge bg-warning">Submitted</span>
+          `}
+        </div>
+      </div>
+      ${entry.adminNote ? `<div class="mt-2"><small class="text-warning"><i class="fas fa-info-circle"></i> ${entry.adminNote}</small></div>` : ''}
+    </div>
+  `).join('');
+  
+  document.getElementById('submitWeekBtn').disabled = hasSubmitted;
+  if (hasSubmitted) {
+    document.getElementById('submitWeekBtn').textContent = 'Week Already Submitted';
+    document.getElementById('addEntryBtn').disabled = true;
+  } else {
+    document.getElementById('submitWeekBtn').textContent = 'Submit Week for Review';
+    document.getElementById('addEntryBtn').disabled = false;
+  }
+  
+  updateTotals(entries);
+}
+
+function updateTotals(entries) {
+  const totalHours = entries.reduce((sum, e) => sum + e.hours, 0);
+  const totalPay = entries.reduce((sum, e) => sum + e.grossPay, 0);
+  
+  document.getElementById('totalHours').textContent = totalHours.toFixed(2);
+  document.getElementById('totalGrossPay').textContent = formatCurrency(totalPay);
+}
+
+function showAddEntry() {
+  document.getElementById('entryModalTitle').textContent = 'Add Entry';
+  document.getElementById('entryForm').reset();
+  document.getElementById('entryId').value = '';
+  document.getElementById('entryDate').value = new Date().toISOString().split('T')[0];
+  entryModal.show();
+}
+
+function editEntry(id, date, hours, description) {
+  document.getElementById('entryModalTitle').textContent = 'Edit Entry';
+  document.getElementById('entryId').value = id;
+  
+  // Convert MM/DD/YYYY to YYYY-MM-DD
+  const parts = date.split('/');
+  document.getElementById('entryDate').value = `${parts[2]}-${parts[0].padStart(2, '0')}-${parts[1].padStart(2, '0')}`;
+  
+  document.getElementById('entryHours').value = hours;
+  document.getElementById('entryDescription').value = description;
+  calculateGrossPay();
+  entryModal.show();
+}
+
+function calculateGrossPay() {
+  const hours = parseFloat(document.getElementById('entryHours').value) || 0;
+  const grossPay = hours * currentUser.hourlyRate;
+  document.getElementById('entryGrossPay').value = formatCurrency(grossPay);
+}
+
+function saveEntry() {
+  const entryId = document.getElementById('entryId').value;
+  const date = document.getElementById('entryDate').value;
+  const hours = parseFloat(document.getElementById('entryHours').value);
+  const description = document.getElementById('entryDescription').value;
+  
+  if (!date || !hours || !description) {
+    alert('Please fill in all fields');
+    return;
+  }
+  
+  if (entryId) {
+    // Update existing entry
+    google.script.run
+      .withSuccessHandler(function(result) {
+        if (result.success) {
+          entryModal.hide();
+          loadPendingTimesheet();
+        } else {
+          alert(result.message);
+        }
+      })
+      .withFailureHandler(handleError)
+      .updateTimesheetEntry(entryId, date, hours, currentUser.hourlyRate, description);
+  } else {
+    // Add new entry
+    google.script.run
+      .withSuccessHandler(function(result) {
+        if (result.success) {
+          entryModal.hide();
+          loadPendingTimesheet();
+        }
+      })
+      .withFailureHandler(handleError)
+      .addTimesheetEntry(currentUser.employeeId, currentUser.hourlyRate, date, hours, description);
+  }
+}
+
+function deleteEntry(entryId) {
+  if (!confirm('Are you sure you want to delete this entry?')) return;
+  
+  google.script.run
+    .withSuccessHandler(function(result) {
+      if (result.success) {
+        loadPendingTimesheet();
+      } else {
+        alert(result.message);
+      }
+    })
+    .withFailureHandler(handleError)
+    .deleteTimesheetEntry(entryId);
+}
+
+function submitWeek() {
+  if (!confirm('Submit this week for admin review? You will not be able to edit entries after submission.')) return;
+  
+  google.script.run
+    .withSuccessHandler(function(result) {
+      if (result.success) {
+        alert('Week submitted successfully! Admins have been notified.');
+        loadPendingTimesheet();
+      } else {
+        alert(result.message);
+      }
+    })
+    .withFailureHandler(handleError)
+    .submitWeeklyTimesheet(currentUser.employeeId);
+}
+
+function loadHistoricalTimesheets() {
+  google.script.run
+    .withSuccessHandler(displayHistoricalTimesheets)
+    .withFailureHandler(handleError)
+    .getHistoricalTimesheets(currentUser.employeeId);
+}
+
+function displayHistoricalTimesheets(data) {
+  displayHistoryList('approvedList', data.approved, 'approved');
+  displayHistoryList('deniedList', data.denied, 'denied');
+  displayHistoryList('pendingList', data.pending, 'pending');
+}
+
+function displayHistoryList(containerId, entries, type) {
+  const container = document.getElementById(containerId);
+  
+  if (entries.length === 0) {
+    container.innerHTML = `<p class="text-muted text-center py-3">No ${type} timesheets found.</p>`;
+    return;
+  }
+  
+  // Group by week
+  const weeks = {};
+  entries.forEach(entry => {
+    if (!weeks[entry.weekStart]) weeks[entry.weekStart] = [];
+    weeks[entry.weekStart].push(entry);
+  });
+  
+  // Paginate
+  const weeksArray = Object.entries(weeks);
+  const page = 1;
+  const perPage = 25;
+  const start = (page - 1) * perPage;
+  const end = start + perPage;
+  const pageWeeks = weeksArray.slice(start, end);
+  
+  const badgeClass = type === 'approved' ? 'bg-success' : type === 'denied' ? 'bg-danger' : 'bg-warning';
+  const statusText = type.toUpperCase();
+  
+  container.innerHTML = pageWeeks.map(([weekStart, weekEntries]) => `
+    <div class="card mb-2">
+      <div class="card-header">
+        <strong>Week of ${weekStart}</strong>
+        <span class="float-end badge ${badgeClass}">
+          ${statusText}
+        </span>
+      </div>
+      <div class="card-body">
+        ${weekEntries.map(entry => `
+          <div class="mb-2 pb-2 border-bottom">
+            <div><strong>${entry.date}</strong> - ${entry.hours} hrs - ${formatCurrency(entry.grossPay)}</div>
+            <div><small class="text-muted">${entry.description}</small></div>
+            ${entry.status ? `<div><small class="badge ${entry.status === 'Pending' ? 'bg-secondary' : 'bg-info'}">${entry.status}</small></div>` : ''}
+            ${entry.adminNote ? `<div><small class="text-warning"><i class="fas fa-info-circle"></i> ${entry.adminNote}</small></div>` : ''}
+            ${entry.reason ? `<div><small class="text-danger"><i class="fas fa-exclamation-triangle"></i> ${entry.reason}</small></div>` : ''}
+          </div>
+        `).join('')}
+      </div>
+    </div>
+  `).join('');
+}
+
+// ===== ADMIN DASHBOARD =====
+function showAdminDashboard() {
+  document.getElementById('adminName').textContent = currentUser.name;
+  document.getElementById('adminDashboard').classList.remove('d-none');
+  loadSubmittedTimesheets();
+}
+
+function loadSubmittedTimesheets() {
+  google.script.run
+    .withSuccessHandler(displaySubmittedTimesheets)
+    .withFailureHandler(handleError)
+    .getSubmittedTimesheets();
+}
+
+function displaySubmittedTimesheets(timesheets) {
+  const container = document.getElementById('submittedTimesheets');
+  
+  if (timesheets.length === 0) {
+    container.innerHTML = `
+      <div class="alert alert-info text-center">
+        <i class="fas fa-inbox fa-3x mb-3 d-block"></i>
+        <p class="mb-0">No submitted timesheets to review.</p>
+      </div>
+    `;
+    return;
+  }
+  
+  container.innerHTML = timesheets.map((ts, idx) => `
+    <div class="timesheet-summary" onclick="toggleDetails(${idx})">
+      <div class="d-flex justify-content-between align-items-center">
+        <div>
+          <h6 class="mb-1">${ts.employeeName} (ID: ${ts.employeeId})</h6>
+          <small class="text-muted">Week of ${ts.weekStart}</small>
+        </div>
+        <div class="text-end">
+          <div><span class="badge bg-info">${ts.totalHours.toFixed(2)} hrs</span></div>
+          <div><span class="badge bg-success">${formatCurrency(ts.totalGrossPay)}</span></div>
+        </div>
+      </div>
+    </div>
+    <div id="details-${idx}" class="d-none mb-3">
+      <div class="card">
+        <div class="card-body">
+          <table class="table table-striped table-hover">
+            <thead>
+              <tr>
+                <th><input type="checkbox" onchange="selectAllEntries(${idx}, this.checked)"></th>
+                <th>Date</th>
+                <th>Hours</th>
+                <th>Gross Pay</th>
+                <th>Description</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${ts.entries.map(entry => `
+                <tr>
+                  <td><input type="checkbox" class="entry-check" data-entry-id="${entry.entryId}"></td>
+                  <td>${entry.date}</td>
+                  <td>${entry.hours}</td>
+                  <td>${formatCurrency(entry.grossPay)}</td>
+                  <td>${entry.description}</td>
+                  <td>
+                    <button class="btn btn-sm btn-outline-warning" onclick="showAdminEdit('${entry.entryId}', ${entry.hours})">
+                      <i class="fas fa-edit"></i>
+                    </button>
+                  </td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+          <div class="mt-3">
+            <button class="btn btn-success me-2" onclick="approveWeek('${ts.employeeId}', '${ts.weekStart}')">
+              <i class="fas fa-check me-2"></i>Approve All
+            </button>
+            <button class="btn btn-primary me-2" onclick="approveSelected()">
+              <i class="fas fa-check-circle me-2"></i>Approve Selected
+            </button>
+            <button class="btn btn-danger me-2" onclick="denyWeek('${ts.employeeId}', '${ts.weekStart}')">
+              <i class="fas fa-times me-2"></i>Deny All
+            </button>
+            <button class="btn btn-outline-danger me-2" onclick="denySelected()">
+              <i class="fas fa-times-circle me-2"></i>Deny Selected
+            </button>
+            <button class="btn btn-warning me-2" onclick="markAsPending()">
+              <i class="fas fa-clock me-2"></i>Mark Selected as Pending
+            </button>
+            <button class="btn btn-info float-end" onclick="finalizeEmployee('${ts.employeeId}', '${ts.weekStart}')">
+              <i class="fas fa-paper-plane me-2"></i>Finalize & Notify
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  `).join('');
+}
+
+function toggleDetails(idx) {
+  const details = document.getElementById(`details-${idx}`);
+  details.classList.toggle('d-none');
+}
+
+function selectAllEntries(idx, checked) {
+  const details = document.getElementById(`details-${idx}`);
+  const checkboxes = details.querySelectorAll('.entry-check');
+  checkboxes.forEach(cb => cb.checked = checked);
+}
+
+function approveWeek(employeeId, weekStart) {
+  const entryIds = getAllEntriesForWeek(employeeId, weekStart);
+  if (entryIds.length === 0) return;
+  
+  if (!confirm(`Approve all ${entryIds.length} entries for this week?`)) return;
+  
+  google.script.run
+    .withSuccessHandler(function(result) {
+      if (result.success) {
+        alert('Week approved successfully!');
+        loadSubmittedTimesheets();
+      }
+    })
+    .withFailureHandler(handleError)
+    .approveEntries(entryIds, currentUser.employeeId);
+}
+
+function approveSelected() {
+  const selected = Array.from(document.querySelectorAll('.entry-check:checked'))
+    .map(cb => cb.dataset.entryId);
+  
+  if (selected.length === 0) {
+    alert('Please select entries to approve');
+    return;
+  }
+  
+  if (!confirm(`Approve ${selected.length} selected entries?`)) return;
+  
+  google.script.run
+    .withSuccessHandler(function(result) {
+      if (result.success) {
+        alert('Entries approved successfully!');
+        loadSubmittedTimesheets();
+      }
+    })
+    .withFailureHandler(handleError)
+    .approveEntries(selected, currentUser.employeeId);
+}
+
+function denyWeek(employeeId, weekStart) {
+  const entryIds = getAllEntriesForWeek(employeeId, weekStart);
+  if (entryIds.length === 0) return;
+  
+  pendingActions.deny = entryIds;
+  denyModal.show();
+}
+
+function denySelected() {
+  const selected = Array.from(document.querySelectorAll('.entry-check:checked'))
+    .map(cb => cb.dataset.entryId);
+  
+  if (selected.length === 0) {
+    alert('Please select entries to deny');
+    return;
+  }
+  
+  pendingActions.deny = selected;
+  denyModal.show();
+}
+
+function markAsPending() {
+  const selected = Array.from(document.querySelectorAll('.entry-check:checked'))
+    .map(cb => cb.dataset.entryId);
+  
+  if (selected.length === 0) {
+    alert('Please select entries to mark as pending');
+    return;
+  }
+  
+  if (!confirm(`Mark ${selected.length} selected entries as Pending? This will allow employees to edit them again.`)) return;
+  
+  google.script.run
+    .withSuccessHandler(function(result) {
+      if (result.success) {
+        alert('Entries marked as Pending successfully! Employee can now edit them.');
+        loadSubmittedTimesheets();
+      }
+    })
+    .withFailureHandler(handleError)
+    .markEntriesAsPending(selected);
+}
+
+function confirmDeny() {
+  const reason = document.getElementById('denyReason').value;
+  if (!reason) {
+    alert('Please provide a reason for denial');
+    return;
+  }
+  
+  google.script.run
+    .withSuccessHandler(function(result) {
+      if (result.success) {
+        alert('Entries denied successfully!');
+        denyModal.hide();
+        document.getElementById('denyReason').value = '';
+        loadSubmittedTimesheets();
+      }
+    })
+    .withFailureHandler(handleError)
+    .denyEntries(pendingActions.deny, currentUser.employeeId, reason);
+}
+
+function showAdminEdit(entryId, hours) {
+  document.getElementById('adminEditEntryId').value = entryId;
+  document.getElementById('adminEditHours').value = hours;
+  document.getElementById('adminEditNote').value = '';
+  adminEditModal.show();
+}
+
+function saveAdminEdit() {
+  const entryId = document.getElementById('adminEditEntryId').value;
+  const hours = parseFloat(document.getElementById('adminEditHours').value);
+  const note = document.getElementById('adminEditNote').value;
+  
+  if (!hours || !note) {
+    alert('Please fill in all fields');
+    return;
+  }
+  
+  google.script.run
+    .withSuccessHandler(function(result) {
+      if (result.success) {
+        alert('Entry updated successfully!');
+        adminEditModal.hide();
+        loadSubmittedTimesheets();
+      }
+    })
+    .withFailureHandler(handleError)
+    .adminEditEntry(entryId, hours, currentUser.employeeId, note);
+}
+
+function finalizeEmployee(employeeId, weekStart) {
+  if (!confirm('Send notification email to employee about their timesheet review?')) return;
+  
+  google.script.run
+    .withSuccessHandler(function(result) {
+      if (result.success) {
+        alert('Employee notified successfully!');
+      }
+    })
+    .withFailureHandler(handleError)
+    .finalizeReview(employeeId, weekStart);
+}
+
+function getAllEntriesForWeek(employeeId, weekStart) {
+  const entries = [];
+  document.querySelectorAll('.entry-check').forEach(cb => {
+    entries.push(cb.dataset.entryId);
+  });
+  return entries;
+}
+
+function loadAllHistorical() {
+  google.script.run
+    .withSuccessHandler(displayAllHistorical)
+    .withFailureHandler(handleError)
+    .getAllHistoricalTimesheets();
+}
+
+function displayAllHistorical(timesheets) {
+  const container = document.getElementById('historicalTimesheets');
+  
+  if (timesheets.length === 0) {
+    container.innerHTML = `<p class="text-muted text-center py-3">No historical timesheets found.</p>`;
+    return;
+  }
+  
+  container.innerHTML = timesheets.map((ts, idx) => `
+    <div class="timesheet-summary" onclick="toggleHistDetails(${idx})">
+      <div class="d-flex justify-content-between align-items-center">
+        <div>
+          <h6 class="mb-1">${ts.employeeName} (ID: ${ts.employeeId})</h6>
+          <small class="text-muted">Week of ${ts.weekStart}</small>
+        </div>
+        <div>
+          <span class="badge ${
+            ts.status === 'Approved' ? 'bg-success' : 
+            ts.status === 'Denied' ? 'bg-danger' : 'bg-warning'
+          }">${ts.status}</span>
+        </div>
+      </div>
+    </div>
+    <div id="hist-details-${idx}" class="d-none mb-3">
+      <div class="card">
+        <div class="card-body">
+          ${ts.entries.map(entry => `
+            <div class="mb-2 pb-2 border-bottom">
+              <div class="row">
+                <div class="col-md-2"><strong>${entry.date}</strong></div>
+                <div class="col-md-2">${entry.hours} hrs</div>
+                <div class="col-md-2">${formatCurrency(entry.grossPay)}</div>
+                <div class="col-md-4">${entry.description}</div>
+                <div class="col-md-2">
+                  <span class="badge ${entry.status === 'Approved' ? 'bg-success' : 'bg-danger'}">
+                    ${entry.status}
+                  </span>
+                </div>
+              </div>
+            </div>
+          `).join('')}
+        </div>
+      </div>
+    </div>
+  `).join('');
+}
+
+function toggleHistDetails(idx) {
+  const details = document.getElementById(`hist-details-${idx}`);
+  details.classList.toggle('d-none');
+}
+
+function installTrigger() {
+  if (!confirm('Install auto-submit trigger for Sundays at 4:00 AM?')) return;
+  
+  google.script.run
+    .withSuccessHandler(function(result) {
+      if (result.success) {
+        alert(result.message);
+      }
+    })
+    .withFailureHandler(handleError)
+    .installAutoSubmitTrigger();
+}
+
+// ===== UTILITY FUNCTIONS =====
+function formatCurrency(amount) {
+  return '₹' + parseFloat(amount).toFixed(2);
+}
+
+function showLoading(formId) {
+  const form = document.getElementById(formId);
+  const btn = form.querySelector('button[type="submit"]');
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Loading...';
+  }
+}
+
+function hideLoading(formId) {
+  const form = document.getElementById(formId);
+  const btn = form.querySelector('button[type="submit"]');
+  if (btn) {
+    btn.disabled = false;
+    btn.innerHTML = '<i class="fas fa-sign-in-alt me-2"></i>Login';
+  }
+}
+
+function showError(elementId, message) {
+  const el = document.getElementById(elementId);
+  el.textContent = message;
+  el.classList.remove('d-none');
+  setTimeout(() => el.classList.add('d-none'), 5000);
+}
+
+function showSuccess(elementId, message) {
+  const el = document.getElementById(elementId);
+  el.textContent = message;
+  el.classList.remove('d-none');
+  setTimeout(() => el.classList.add('d-none'), 5000);
+}
+
+function handleError(error) {
+  console.error('Error:', error);
+  alert('An error occurred: ' + error.message);
+}
+</script>
